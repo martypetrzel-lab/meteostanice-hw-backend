@@ -15,13 +15,11 @@ const PORT = process.env.PORT || 3000;
 const VIRTUAL_ENERGY = {
   enabled: true,
 
-  // Panel
   PANEL_MAX_W: 3.0,    // tvůj 5V 3W panel
   LUX_FULL: 30000,     // doladíš podle reality (venku poledne často 30–80k)
   GAMMA: 1.2,          // lehká nelinearita
   LUX_MIN_ON: 15,      // pod tímto lux = 0W (stín/šum)
 
-  // Spotřeba (odhad)
   V_BATT_EST: 3.7,     // bez měření baterie bereme typickou Li-ion
   I_ESP_MA: 100,       // průměr ESP32 + senzory
   I_FAN_MAX_MA: 200    // tvůj větrák 5V/200mA
@@ -30,17 +28,14 @@ const VIRTUAL_ENERGY = {
 const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
 const nowKey = () => new Date().toISOString().slice(0, 10);
 
-function hhmmss() {
-  const d = new Date();
-  const hh = String(d.getHours()).padStart(2, "0");
-  const mm = String(d.getMinutes()).padStart(2, "0");
-  const ss = String(d.getSeconds()).padStart(2, "0");
-  return `${hh}:${mm}:${ss}`;
+// ✅ Ukládáme do historie timestamp (ms). UI si to převede na lokální čas (Europe/Prague)
+function tsNow() {
+  return Date.now();
 }
 
 function pushSeries(arr, v, max = 2000) {
   if (!Number.isFinite(v)) return;
-  arr.push({ t: hhmmss(), v });
+  arr.push({ t: tsNow(), v });
   if (arr.length > max) arr.splice(0, arr.length - max);
 }
 
@@ -82,19 +77,16 @@ function estimateLoadW(fanDuty) {
   return Number.isFinite(pout) ? pout : 0;
 }
 
-// interní: pro integraci energie
 let lastEnergyTs = Date.now();
 
 /**
- * integrace do Wh: Wh += P(W) * dt(h)
- * + synchronizace do state.energy (aby UI 3.36.0 umělo číst)
+ * integrace do Wh + sync do state.energy pro UI 3.36.0
  */
 function integrateEnergy(pinW, poutW, nowTs) {
   const dtMs = Math.max(0, nowTs - lastEnergyTs);
   lastEnergyTs = nowTs;
 
-  // ochrana: když server spí a probudí se, neintegruj extrémy
-  const dtClampedMs = Math.min(dtMs, 60_000); // max 60s najednou
+  const dtClampedMs = Math.min(dtMs, 60_000);
   const dtH = dtClampedMs / 3600000.0;
 
   const inWh = pinW * dtH;
@@ -105,18 +97,16 @@ function integrateEnergy(pinW, poutW, nowTs) {
   t.energyOutWh = (t.energyOutWh || 0) + outWh;
   t.energyNetWh = (t.energyInWh || 0) - (t.energyOutWh || 0);
 
-  // UI "ENERGIE" + "DNES" čte ze state.energy.*
   state.energy.totals.wh_in_today = t.energyInWh;
   state.energy.totals.wh_out_today = t.energyOutWh;
   state.energy.totals.wh_net_today = t.energyNetWh;
 
-  // do device.power (pro info)
   state.device.power.balanceWh = t.energyNetWh;
 }
 
 /**
  * ============================================================
- * STATE (doplněno o `energy` objekt pro UI 3.36.0)
+ * STATE
  * ============================================================
  */
 const state = {
@@ -142,25 +132,12 @@ const state = {
     cycle: { day: null, week: null, phase: "HW", season: null }
   },
 
-  // ✅ simulátor-kompatibilní energie pro UI adapter
   energy: {
-    // UI v app.js hledá energy -> ina_in/ina_out -> summary/totals
     ina_in: { p_raw: 0, p_ema: 0, voltageV: null, currentA: null, signal_quality: null },
     ina_out:{ p_raw: 0, p_ema: 0, voltageV: null, currentA: null, signal_quality: null },
-    totals: {
-      wh_in_today: 0,
-      wh_out_today: 0,
-      wh_net_today: 0
-    },
-    rolling24h: {
-      wh_in_24h: null,
-      wh_out_24h: null,
-      wh_net_24h: null
-    },
-    states: {
-      power_state: "IDLE",
-      power_path_state: "UNKNOWN"
-    },
+    totals: { wh_in_today: 0, wh_out_today: 0, wh_net_today: 0 },
+    rolling24h: { wh_in_24h: null, wh_out_24h: null, wh_net_24h: null },
+    states: { power_state: "IDLE", power_path_state: "UNKNOWN" },
     deadbandW: null
   },
 
@@ -182,9 +159,7 @@ const state = {
       collectionIntervalSec: 10
     },
     config: {},
-    identity: {
-      panelMaxW: VIRTUAL_ENERGY.PANEL_MAX_W
-    }
+    identity: { panelMaxW: VIRTUAL_ENERGY.PANEL_MAX_W }
   },
 
   memory: {
@@ -201,18 +176,9 @@ const state = {
   },
 
   events: [],
-
-  brain: {
-    mode: "HW",
-    message: { text: "HW režim: sběr z ESP32", details: [] }
-  }
+  brain: { mode: "HW", message: { text: "HW režim: sběr z ESP32", details: [] } }
 };
 
-/**
- * ============================================================
- * INGEST
- * ============================================================
- */
 function applyIngest(payload) {
   const now = Date.now();
   state.time.now = now;
@@ -226,7 +192,6 @@ function applyIngest(payload) {
   const outTempC = Number(env.outdoorTempC);
   const lux = Number(env.lightLux ?? env.lux ?? env.light);
 
-  // --- world.environment ---
   const we = state.world.environment;
 
   if (Number.isFinite(boxTempC)) {
@@ -253,7 +218,6 @@ function applyIngest(payload) {
   state.world.time.now = now;
   state.world.time.isDay = !env.isNight;
 
-  // --- device ---
   if (Number.isFinite(boxTempC)) state.device.temperature = boxTempC;
   if (Number.isFinite(humPct)) state.device.humidity = humPct;
   if (Number.isFinite(lux)) state.device.light = Math.round(lux);
@@ -264,7 +228,6 @@ function applyIngest(payload) {
   state.device.sensors.ds18b20.tempC = Number.isFinite(outTempC) ? outTempC : state.device.sensors.ds18b20.tempC;
   state.device.sensors.bh1750.lux = Number.isFinite(lux) ? lux : state.device.sensors.bh1750.lux;
 
-  // --- rollover dne ---
   const key = nowKey();
   if (state.memory.today.key !== key) {
     state.memory.days.push(state.memory.today);
@@ -280,38 +243,29 @@ function applyIngest(payload) {
       totals: { energyInWh: 0, energyOutWh: 0, energyNetWh: 0 }
     };
 
-    // reset integrace
     lastEnergyTs = now;
-
-    // reset energy totals
     state.energy.totals.wh_in_today = 0;
     state.energy.totals.wh_out_today = 0;
     state.energy.totals.wh_net_today = 0;
   }
 
-  // --- series ---
   pushSeries(state.memory.today.temperature, boxTempC);
   pushSeries(state.memory.today.light, lux);
 
-  // --- VIRTUÁLNÍ ENERGIE ---
   const pinW = estimateSolarInW(lux);
   const poutW = estimateLoadW(duty);
 
-  // do world pro "Solární potenciál"
   we.solarPotentialW = pinW;
 
-  // do device.power (informativní)
   state.device.power.solarInW = pinW;
   state.device.power.loadW = poutW;
   state.device.power.collectionIntervalSec = 10;
 
-  // ✅ do simulátor-kompat energy (UI čte odsud)
   state.energy.ina_in.p_raw = pinW;
-  state.energy.ina_in.p_ema = pinW;   // jednoduché EMA = stejné (zatím)
+  state.energy.ina_in.p_ema = pinW;
   state.energy.ina_out.p_raw = poutW;
   state.energy.ina_out.p_ema = poutW;
 
-  // stav/power-path (bez INA jen odhad)
   if (pinW > 0.05 && poutW > 0.05) {
     state.energy.states.power_state = "MIXED";
     state.energy.states.power_path_state = "SOLAR_TO_LOAD";
@@ -331,14 +285,12 @@ function applyIngest(payload) {
 
   integrateEnergy(pinW, poutW, now);
 
-  // --- brain placeholder ---
   state.brain.message.text = env.isNight
     ? "Noc: běžím úsporně, hlídám teplotu boxu (HW + virtuální energie)"
     : "Den: sbírám data, řídím ventilátor (HW + virtuální energie)";
   state.brain.mode = env.isNight ? "NIGHT" : "DAY";
 }
 
-// --- routes ---
 app.get("/health", (req, res) => res.json({ ok: true, mode: "HW", now: Date.now() }));
 app.get("/state", (req, res) => res.json(state));
 
