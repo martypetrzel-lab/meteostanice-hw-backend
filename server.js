@@ -11,106 +11,25 @@ const PORT = process.env.PORT || 3000;
  * ============================================================
  * VIRTUÁLNÍ ENERGIE (bez INA219) – KONFIG
  * ============================================================
- * Odhad P_in ze světla (BH1750 lux):
- *   solarFrac = clamp(lux / LUX_FULL, 0..1)
- *   P_in = PANEL_MAX_W * solarFrac^GAMMA
- *
- * Odhad P_out ze spotřeby:
- *   ESP32: I_esp_mA
- *   Fan:   I_fan_max_mA * (duty/255)
- *   P_out ~ V_BATT_EST * (I_total_mA / 1000)
  */
 const VIRTUAL_ENERGY = {
   enabled: true,
 
   // Panel
   PANEL_MAX_W: 3.0,    // tvůj 5V 3W panel
-  LUX_FULL: 30000,     // doladíš podle reality (venku poledne klidně 30–60k)
+  LUX_FULL: 30000,     // doladíš podle reality (venku poledne často 30–80k)
   GAMMA: 1.2,          // lehká nelinearita
   LUX_MIN_ON: 15,      // pod tímto lux = 0W (stín/šum)
 
   // Spotřeba (odhad)
-  V_BATT_EST: 3.7,     // bez měření bereme typickou Li-ion
+  V_BATT_EST: 3.7,     // bez měření baterie bereme typickou Li-ion
   I_ESP_MA: 100,       // průměr ESP32 + senzory
-  I_FAN_MAX_MA: 200    // tvůj 5V 30x30 větrák cca 200mA max
+  I_FAN_MAX_MA: 200    // tvůj větrák 5V/200mA
 };
 
-// --- runtime store (in-memory) ---
-const state = {
-  time: { now: Date.now(), isDay: true },
-  world: {
-    environment: {
-      light: null,
-      lightLux: null,
-      lux: null,
+const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+const nowKey = () => new Date().toISOString().slice(0, 10);
 
-      // UI kompatibilita
-      boxTempC: null,
-      indoorTempC: null,
-      indoorHumPct: null,
-      outdoorTempC: null,
-      airTempC: null,
-
-      // doplníme i "solární potenciál" odhadem
-      solarPotentialW: null,
-
-      scenario: "HW",
-      stressPattern: "HW",
-      phase: "HW"
-    },
-    time: { now: Date.now(), isDay: true },
-    cycle: { day: null, week: null, phase: "HW", season: null }
-  },
-  device: {
-    temperature: null,
-    humidity: null,
-    light: null,
-    fan: false,
-    sensors: {
-      dht22: { tempC: null, humidity: null },
-      ds18b20: { tempC: null },
-      bh1750: { lux: null }
-    },
-    battery: null,
-    power: {
-      solarInW: 0,
-      loadW: 0,
-      balanceWh: 0,
-      collectionIntervalSec: 10
-    },
-    config: {},
-    identity: {
-      panelMaxW: VIRTUAL_ENERGY.PANEL_MAX_W
-    }
-  },
-  memory: {
-    today: {
-      key: new Date().toISOString().slice(0, 10),
-      temperature: [],
-      light: [],
-      brainRisk: [],
-      energyIn: [],
-      energyOut: [],
-      totals: {
-        energyInWh: 0,
-        energyOutWh: 0,
-        energyNetWh: 0
-      }
-    },
-    days: []
-  },
-  events: [],
-  brain: {
-    mode: "HW",
-    message: { text: "HW režim: sběr z ESP32", details: [] }
-  }
-};
-
-// interní: pro integraci energie
-let lastEnergyTs = Date.now();
-
-function clamp(x, a, b) { return Math.max(a, Math.min(b, x)); }
-function nowKey() { return new Date().toISOString().slice(0, 10); }
 function hhmmss() {
   const d = new Date();
   const hh = String(d.getHours()).padStart(2, "0");
@@ -139,7 +58,7 @@ function logEvent(key, message, level = "info", meta = null) {
 
 /**
  * ============================================================
- * VIRTUÁLNÍ ENERGIE – výpočet P_in / P_out
+ * VIRTUÁLNÍ ENERGIE – odhad P_in / P_out
  * ============================================================
  */
 function estimateSolarInW(lux) {
@@ -155,7 +74,6 @@ function estimateLoadW(fanDuty) {
   if (!VIRTUAL_ENERGY.enabled) return 0;
 
   const d = Number.isFinite(fanDuty) ? clamp(fanDuty, 0, 255) : 0;
-
   const iEsp = VIRTUAL_ENERGY.I_ESP_MA;
   const iFan = VIRTUAL_ENERGY.I_FAN_MAX_MA * (d / 255);
 
@@ -164,14 +82,18 @@ function estimateLoadW(fanDuty) {
   return Number.isFinite(pout) ? pout : 0;
 }
 
+// interní: pro integraci energie
+let lastEnergyTs = Date.now();
+
 /**
  * integrace do Wh: Wh += P(W) * dt(h)
+ * + synchronizace do state.energy (aby UI 3.36.0 umělo číst)
  */
 function integrateEnergy(pinW, poutW, nowTs) {
   const dtMs = Math.max(0, nowTs - lastEnergyTs);
   lastEnergyTs = nowTs;
 
-  // ochrana: když server spí a probudí se po dlouhé době, neintegruj bláznoviny
+  // ochrana: když server spí a probudí se, neintegruj extrémy
   const dtClampedMs = Math.min(dtMs, 60_000); // max 60s najednou
   const dtH = dtClampedMs / 3600000.0;
 
@@ -183,8 +105,108 @@ function integrateEnergy(pinW, poutW, nowTs) {
   t.energyOutWh = (t.energyOutWh || 0) + outWh;
   t.energyNetWh = (t.energyInWh || 0) - (t.energyOutWh || 0);
 
+  // UI "ENERGIE" + "DNES" čte ze state.energy.*
+  state.energy.totals.wh_in_today = t.energyInWh;
+  state.energy.totals.wh_out_today = t.energyOutWh;
+  state.energy.totals.wh_net_today = t.energyNetWh;
+
+  // do device.power (pro info)
   state.device.power.balanceWh = t.energyNetWh;
 }
+
+/**
+ * ============================================================
+ * STATE (doplněno o `energy` objekt pro UI 3.36.0)
+ * ============================================================
+ */
+const state = {
+  time: { now: Date.now(), isDay: true },
+  world: {
+    environment: {
+      light: null,
+      lightLux: null,
+      lux: null,
+      solarPotentialW: null,
+
+      boxTempC: null,
+      indoorTempC: null,
+      indoorHumPct: null,
+      outdoorTempC: null,
+      airTempC: null,
+
+      scenario: "HW",
+      stressPattern: "HW",
+      phase: "HW"
+    },
+    time: { now: Date.now(), isDay: true },
+    cycle: { day: null, week: null, phase: "HW", season: null }
+  },
+
+  // ✅ simulátor-kompatibilní energie pro UI adapter
+  energy: {
+    // UI v app.js hledá energy -> ina_in/ina_out -> summary/totals
+    ina_in: { p_raw: 0, p_ema: 0, voltageV: null, currentA: null, signal_quality: null },
+    ina_out:{ p_raw: 0, p_ema: 0, voltageV: null, currentA: null, signal_quality: null },
+    totals: {
+      wh_in_today: 0,
+      wh_out_today: 0,
+      wh_net_today: 0
+    },
+    rolling24h: {
+      wh_in_24h: null,
+      wh_out_24h: null,
+      wh_net_24h: null
+    },
+    states: {
+      power_state: "IDLE",
+      power_path_state: "UNKNOWN"
+    },
+    deadbandW: null
+  },
+
+  device: {
+    temperature: null,
+    humidity: null,
+    light: null,
+    fan: false,
+    sensors: {
+      dht22: { tempC: null, humidity: null },
+      ds18b20: { tempC: null },
+      bh1750: { lux: null }
+    },
+    battery: null,
+    power: {
+      solarInW: 0,
+      loadW: 0,
+      balanceWh: 0,
+      collectionIntervalSec: 10
+    },
+    config: {},
+    identity: {
+      panelMaxW: VIRTUAL_ENERGY.PANEL_MAX_W
+    }
+  },
+
+  memory: {
+    today: {
+      key: new Date().toISOString().slice(0, 10),
+      temperature: [],
+      light: [],
+      brainRisk: [],
+      energyIn: [],
+      energyOut: [],
+      totals: { energyInWh: 0, energyOutWh: 0, energyNetWh: 0 }
+    },
+    days: []
+  },
+
+  events: [],
+
+  brain: {
+    mode: "HW",
+    message: { text: "HW režim: sběr z ESP32", details: [] }
+  }
+};
 
 /**
  * ============================================================
@@ -199,13 +221,12 @@ function applyIngest(payload) {
   const fan = payload?.fan || {};
   const duty = Number(fan.duty);
 
-  // --- normalize values ---
   const boxTempC = Number(env.boxTempC);
   const humPct = Number(env.indoorHumPct);
   const outTempC = Number(env.outdoorTempC);
   const lux = Number(env.lightLux ?? env.lux ?? env.light);
 
-  // --- world.environment for UI adapter ---
+  // --- world.environment ---
   const we = state.world.environment;
 
   if (Number.isFinite(boxTempC)) {
@@ -232,20 +253,18 @@ function applyIngest(payload) {
   state.world.time.now = now;
   state.world.time.isDay = !env.isNight;
 
-  // --- device block (legacy keys your UI uses) ---
+  // --- device ---
   if (Number.isFinite(boxTempC)) state.device.temperature = boxTempC;
   if (Number.isFinite(humPct)) state.device.humidity = humPct;
   if (Number.isFinite(lux)) state.device.light = Math.round(lux);
+  if (Number.isFinite(duty)) state.device.fan = duty > 0;
 
   state.device.sensors.dht22.tempC = Number.isFinite(boxTempC) ? boxTempC : state.device.sensors.dht22.tempC;
   state.device.sensors.dht22.humidity = Number.isFinite(humPct) ? humPct : state.device.sensors.dht22.humidity;
   state.device.sensors.ds18b20.tempC = Number.isFinite(outTempC) ? outTempC : state.device.sensors.ds18b20.tempC;
   state.device.sensors.bh1750.lux = Number.isFinite(lux) ? lux : state.device.sensors.bh1750.lux;
 
-  // fan flag
-  if (Number.isFinite(duty)) state.device.fan = duty > 0;
-
-  // --- memory.today rollover ---
+  // --- rollover dne ---
   const key = nowKey();
   if (state.memory.today.key !== key) {
     state.memory.days.push(state.memory.today);
@@ -261,30 +280,58 @@ function applyIngest(payload) {
       totals: { energyInWh: 0, energyOutWh: 0, energyNetWh: 0 }
     };
 
-    // reset integrace dne (ať nezačne dnešek dt z včerejška)
+    // reset integrace
     lastEnergyTs = now;
+
+    // reset energy totals
+    state.energy.totals.wh_in_today = 0;
+    state.energy.totals.wh_out_today = 0;
+    state.energy.totals.wh_net_today = 0;
   }
 
-  // --- series append ---
+  // --- series ---
   pushSeries(state.memory.today.temperature, boxTempC);
   pushSeries(state.memory.today.light, lux);
 
-  // --- VIRTUÁLNÍ ENERGIE (hlavní přínos) ---
+  // --- VIRTUÁLNÍ ENERGIE ---
   const pinW = estimateSolarInW(lux);
   const poutW = estimateLoadW(duty);
 
+  // do world pro "Solární potenciál"
+  we.solarPotentialW = pinW;
+
+  // do device.power (informativní)
   state.device.power.solarInW = pinW;
   state.device.power.loadW = poutW;
   state.device.power.collectionIntervalSec = 10;
 
-  we.solarPotentialW = pinW;
+  // ✅ do simulátor-kompat energy (UI čte odsud)
+  state.energy.ina_in.p_raw = pinW;
+  state.energy.ina_in.p_ema = pinW;   // jednoduché EMA = stejné (zatím)
+  state.energy.ina_out.p_raw = poutW;
+  state.energy.ina_out.p_ema = poutW;
+
+  // stav/power-path (bez INA jen odhad)
+  if (pinW > 0.05 && poutW > 0.05) {
+    state.energy.states.power_state = "MIXED";
+    state.energy.states.power_path_state = "SOLAR_TO_LOAD";
+  } else if (pinW > 0.05) {
+    state.energy.states.power_state = "CHARGING";
+    state.energy.states.power_path_state = "SOLAR_TO_BATT";
+  } else if (poutW > 0.05) {
+    state.energy.states.power_state = "DISCHARGING";
+    state.energy.states.power_path_state = "BATT_TO_LOAD";
+  } else {
+    state.energy.states.power_state = "IDLE";
+    state.energy.states.power_path_state = "UNKNOWN";
+  }
 
   pushSeries(state.memory.today.energyIn, pinW);
   pushSeries(state.memory.today.energyOut, poutW);
 
   integrateEnergy(pinW, poutW, now);
 
-  // --- “brain” placeholder ---
+  // --- brain placeholder ---
   state.brain.message.text = env.isNight
     ? "Noc: běžím úsporně, hlídám teplotu boxu (HW + virtuální energie)"
     : "Den: sbírám data, řídím ventilátor (HW + virtuální energie)";
