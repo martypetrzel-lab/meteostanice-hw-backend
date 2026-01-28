@@ -4,7 +4,10 @@ import fs from "fs";
 import path from "path";
 
 const app = express();
-app.use(express.json({ limit: "2mb" }));
+
+// ⚠️ 2mb bývá málo, když posíláš i memory.today s body.
+// Dáme 6mb – pořád bezpečné, ale už tě to nebude brzdit.
+app.use(express.json({ limit: "6mb" }));
 
 // ===== CORS pro GitHub Pages UI =====
 app.use((req, res, next) => {
@@ -27,7 +30,9 @@ let latestMeta = {
 };
 
 function ensureDirSafe(dir) {
-  try { fs.mkdirSync(dir, { recursive: true }); } catch (_) {}
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch (_) {}
 }
 
 function loadLatestFromDisk() {
@@ -56,7 +61,9 @@ function saveLatestToDisk(payloadObj) {
 loadLatestFromDisk();
 
 app.get("/", (req, res) => {
-  res.type("text/plain").send("Meteostanice HW backend running. Use /health, /state, POST /ingest");
+  res
+    .type("text/plain")
+    .send("Meteostanice HW backend running. Use /health, /state, POST /ingest");
 });
 
 app.get("/health", (req, res) => {
@@ -68,6 +75,48 @@ app.get("/health", (req, res) => {
   });
 });
 
+// ===== helper: UI compatibility layer + debug counts =====
+function withUiCompat(state) {
+  if (!state || typeof state !== "object") return state;
+
+  const mem = state.memory;
+
+  // UI-friendly alias (některé UI verze očekávají "history")
+  // -> history.today = memory.today
+  // -> history.days  = memory.days
+  if (mem && typeof mem === "object") {
+    const today = mem.today;
+    const days = mem.days;
+
+    state.history = {
+      today: today || { key: null, temperature: [], light: [], energyIn: [], energyOut: [], brainRisk: [], totals: {} },
+      days: Array.isArray(days) ? days : [],
+    };
+
+    // Debug: kolik bodů v dnešku
+    const tLen = Array.isArray(today?.temperature) ? today.temperature.length : 0;
+    const lLen = Array.isArray(today?.light) ? today.light.length : 0;
+    const inLen = Array.isArray(today?.energyIn) ? today.energyIn.length : 0;
+    const outLen = Array.isArray(today?.energyOut) ? today.energyOut.length : 0;
+    const rLen = Array.isArray(today?.brainRisk) ? today.brainRisk.length : 0;
+
+    state._historyDebug = {
+      dayKey: today?.key ?? null,
+      counts: { temperature: tLen, light: lLen, energyIn: inLen, energyOut: outLen, brainRisk: rLen },
+      daysCount: Array.isArray(days) ? days.length : 0,
+    };
+  } else {
+    // když memory není, nastav aspoň prázdnou history
+    state.history = {
+      today: { key: null, temperature: [], light: [], energyIn: [], energyOut: [], brainRisk: [], totals: {} },
+      days: [],
+    };
+    state._historyDebug = { dayKey: null, counts: { temperature: 0, light: 0, energyIn: 0, energyOut: 0, brainRisk: 0 }, daysCount: 0 };
+  }
+
+  return state;
+}
+
 // UI čte odsud
 app.get("/state", (req, res) => {
   if (!latestState) {
@@ -77,9 +126,12 @@ app.get("/state", (req, res) => {
     });
   }
 
+  // ⚠️ vytvoříme kopii, ať si neničíme latestState v paměti
+  const out = withUiCompat({ ...latestState });
+
   // přidáme info o serveru (užitečné pro debug v UI)
   res.json({
-    ...latestState,
+    ...out,
     _server: {
       now: Date.now(),
       receivedAt: latestMeta.receivedAt,
@@ -105,7 +157,12 @@ app.post("/ingest", (req, res) => {
   saveLatestToDisk(payload);
 
   // odpověď pro ESP32
-  res.json({ ok: true, stored: true, bytes: latestMeta.bytes, receivedAt: latestMeta.receivedAt });
+  res.json({
+    ok: true,
+    stored: true,
+    bytes: latestMeta.bytes,
+    receivedAt: latestMeta.receivedAt,
+  });
 });
 
 const PORT = process.env.PORT || 3000;
