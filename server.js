@@ -4,9 +4,9 @@ import fs from "fs";
 import path from "path";
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 
-// CORS pro GitHub Pages UI
+// ===== CORS pro GitHub Pages UI =====
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -15,8 +15,8 @@ app.use((req, res, next) => {
   next();
 });
 
-// Railway persistent volume (pokud máš připojený volume, dej třeba /data)
-// Když nemáš, pořád to poběží – jen se latest state ztratí při restartu.
+// ===== optional persistence (Railway Volume) =====
+// Pokud máš na Railway připojený volume, nastav DATA_DIR=/data (nebo nech default /data).
 const DATA_DIR = process.env.DATA_DIR || "/data";
 const STATE_FILE = path.join(DATA_DIR, "latest-state.json");
 
@@ -24,13 +24,10 @@ let latestState = null;
 let latestMeta = {
   receivedAt: null,
   bytes: 0,
-  sourceIp: null,
 };
 
 function ensureDirSafe(dir) {
-  try {
-    fs.mkdirSync(dir, { recursive: true });
-  } catch (_) {}
+  try { fs.mkdirSync(dir, { recursive: true }); } catch (_) {}
 }
 
 function loadLatestFromDisk() {
@@ -39,8 +36,9 @@ function loadLatestFromDisk() {
     latestState = JSON.parse(raw);
     latestMeta.receivedAt = Date.now();
     latestMeta.bytes = Buffer.byteLength(raw, "utf8");
+    console.log("[boot] loaded latest-state.json");
   } catch (_) {
-    // ok – zatím nic na disku
+    console.log("[boot] no latest-state.json yet (ok)");
   }
 }
 
@@ -49,8 +47,9 @@ function saveLatestToDisk(payloadObj) {
     ensureDirSafe(DATA_DIR);
     const raw = JSON.stringify(payloadObj);
     fs.writeFileSync(STATE_FILE, raw);
-  } catch (_) {
-    // ok – bez volume to jen nepersistuje
+  } catch (e) {
+    // Bez volume to jen nepersistuje. Nevadí.
+    console.log("[persist] skip (no volume?)", String(e));
   }
 }
 
@@ -74,21 +73,19 @@ app.get("/state", (req, res) => {
   if (!latestState) {
     return res.status(503).json({
       error: "No state ingested yet",
-      hint: "POST your ESP32 /state JSON to /ingest",
+      hint: "ESP32 must POST JSON to /ingest",
     });
   }
 
-  // přidáme info “server time”
-  const out = {
+  // přidáme info o serveru (užitečné pro debug v UI)
+  res.json({
     ...latestState,
     _server: {
-      receivedAt: latestMeta.receivedAt,
       now: Date.now(),
+      receivedAt: latestMeta.receivedAt,
       bytes: latestMeta.bytes,
     },
-  };
-
-  res.json(out);
+  });
 });
 
 // ESP32 sem posílá
@@ -96,22 +93,20 @@ app.post("/ingest", (req, res) => {
   const payload = req.body;
 
   if (!payload || typeof payload !== "object") {
-    return res.status(400).json({ error: "Invalid JSON payload" });
+    return res.status(400).json({ ok: false, error: "Invalid JSON payload" });
   }
 
   latestState = payload;
-  latestMeta.receivedAt = Date.now();
-  latestMeta.sourceIp = req.headers["x-forwarded-for"] || req.socket.remoteAddress || null;
 
   const raw = JSON.stringify(payload);
+  latestMeta.receivedAt = Date.now();
   latestMeta.bytes = Buffer.byteLength(raw, "utf8");
 
   saveLatestToDisk(payload);
 
-  res.json({ ok: true, stored: true, bytes: latestMeta.bytes });
+  // odpověď pro ESP32
+  res.json({ ok: true, stored: true, bytes: latestMeta.bytes, receivedAt: latestMeta.receivedAt });
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`[hw-backend] listening on :${PORT}`);
-});
+app.listen(PORT, () => console.log(`[hw-backend] listening on :${PORT}`));
