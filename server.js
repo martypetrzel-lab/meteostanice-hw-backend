@@ -267,10 +267,40 @@ app.get("/health", (req, res) => {
       daysCount: Array.isArray(historyStore.days) ? historyStore.days.length : 0,
       todaySamples: historyStore.today?.totals?.samples ?? null,
     },
+    _waiting: !latestState,
   });
 });
 
 // ===== helper: UI compatibility layer + debug counts =====
+
+function makeEmptyState() {
+  // Minimální struktura, aby UI nespadlo, když backend ještě nedostal žádná data.
+  return {
+    time: { now: Date.now(), isDay: true },
+    world: {
+      environment: {
+        lightLux: 0,
+        lux: 0,
+        boxTempC: null,
+        indoorTempC: null,
+        indoorHumPct: null,
+        outdoorTempC: null,
+        airTempC: null,
+        solarPotentialW: 0,
+        scenario: "WAITING",
+        phase: "WAITING",
+      },
+    },
+    energy: {
+      ina_in: { p_raw: 0, p_ema: 0, voltageV: null, currentA: null, signal_quality: 0 },
+      ina_out: { p_raw: 0, p_ema: 0, voltageV: null, currentA: null, signal_quality: 0 },
+      states: { power_state: "WAITING", power_path_state: "WAITING" },
+      totals: { wh_in_today: 0, wh_out_today: 0, wh_net_today: 0 },
+    },
+    brain: { risk: 0, conf: 0, mode: "WAITING", message: "Čekám na první data…", batterySafe: "WAITING" },
+  };
+}
+
 function withUiCompat(state) {
   if (!state || typeof state !== "object") return state;
 
@@ -329,15 +359,10 @@ function withUiCompat(state) {
 
 // UI čte odsud
 app.get("/state", (req, res) => {
-  if (!latestState) {
-    return res.status(503).json({
-      error: "No state ingested yet",
-      hint: "ESP32 must POST JSON to /ingest",
-    });
-  }
+  const base = latestState ? { ...latestState } : makeEmptyState();
 
-  // ⚠️ vytvoříme kopii, ať si neničíme latestState v paměti
-  const out = withUiCompat({ ...latestState });
+  // ⚠️ vytvoříme kopii, ať si neničíme state v paměti
+  const out = withUiCompat(base);
 
   // přidáme info o serveru (užitečné pro debug v UI)
   res.json({
@@ -347,6 +372,7 @@ app.get("/state", (req, res) => {
       receivedAt: latestMeta.receivedAt,
       bytes: latestMeta.bytes,
     },
+    _waiting: !latestState,
   });
 });
 
