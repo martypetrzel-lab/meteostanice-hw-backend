@@ -2,6 +2,72 @@
 import express from "express";
 import fs from "fs";
 import path from "path";
+import pg from "pg";
+const { Pool } = pg;
+
+// ===== PostgreSQL (Railway) – lifetime historie =====
+const DATABASE_URL = process.env.DATABASE_URL || process.env.PG_URL || process.env.POSTGRES_URL || "";
+const DB_ENABLED = !!DATABASE_URL;
+let dbPool = null;
+
+function dbPoolInit(){
+  if (!DB_ENABLED) return null;
+  if (dbPool) return dbPool;
+  dbPool = new Pool({
+    connectionString: DATABASE_URL,
+    ssl: DATABASE_URL.includes("railway") || DATABASE_URL.includes("postgres") ? { rejectUnauthorized: false } : undefined,
+    max: 5,
+  });
+  dbPool.on("error", (err) => console.log("[db] pool error", String(err)));
+  return dbPool;
+}
+
+async function dbExec(sql, params=[]){
+  const pool = dbPoolInit();
+  if (!pool) return null;
+  const client = await pool.connect();
+  try {
+    const r = await client.query(sql, params);
+    return r;
+  } finally {
+    client.release();
+  }
+}
+
+async function dbInit(){
+  if (!DB_ENABLED) {
+    console.log("[db] disabled (no DATABASE_URL)");
+    return;
+  }
+  try {
+    await dbExec(`
+      CREATE TABLE IF NOT EXISTS daily_stats (
+        day DATE PRIMARY KEY,
+        solar_wh DOUBLE PRECISION DEFAULT 0,
+        load_wh DOUBLE PRECISION DEFAULT 0,
+        net_wh DOUBLE PRECISION DEFAULT 0,
+        temp_out_min DOUBLE PRECISION,
+        temp_out_max DOUBLE PRECISION,
+        temp_out_sum DOUBLE PRECISION DEFAULT 0,
+        temp_out_n INTEGER DEFAULT 0,
+        temp_out_avg DOUBLE PRECISION,
+        lux_max DOUBLE PRECISION,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS records (
+        key TEXT PRIMARY KEY,
+        day DATE,
+        value DOUBLE PRECISION,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    console.log("[db] init ok");
+  } catch (e) {
+    console.log("[db] init failed:", String(e));
+  }
+}
+
 
 const app = express();
 
@@ -111,6 +177,9 @@ function saveHistoryToDisk() {
 
 loadLatestFromDisk();
 
+// init DB (if configured)
+dbInit();
+
 // --- helpers ---
 function pick(obj, paths, fallback = undefined) {
   for (const p of paths) {
@@ -124,6 +193,18 @@ function pick(obj, paths, fallback = undefined) {
     if (ok && cur !== undefined && cur !== null) return cur;
   }
   return fallback;
+}
+
+
+function isoDay(d){
+  // expects YYYY-MM-DD
+  return String(d || "").slice(0,10);
+}
+
+function pragueDayFromPayload(payload){
+  const nowMs = pick(payload, ["time.now", "time.nowMs", "time.ts", "now", "ts", "timestamp"], Date.now());
+  const ms = Number.isFinite(+nowMs) ? +nowMs : Date.now();
+  return toPragueDayKey(ms);
 }
 
 function toPragueDayKey(tsMs) {
@@ -301,6 +382,63 @@ function makeEmptyState() {
   };
 }
 
+// ===== DB: update daily aggregates from payload =====
+async function dbUpdateDailyFromPayload(payload){
+  if (!DB_ENABLED) return;
+  const dayKey = pragueDayFromPayload(payload);
+  // Energy totals (Wh) – prefer daily totals provided by ESP; fallback integrate not implemented.
+  const e = pick(payload, ["energy", "state.energy", "power", "state.power"], {});
+  const sum = pick(e, ["summary", "totals", "stats"], {});
+  const whIn = Number(pick(e, ["totals.wh_in_today", "wh_in_today", "whInToday"], pick(sum, ["wh_in_today", "whInToday"], NaN)));
+  const whOut = Number(pick(e, ["totals.wh_out_today", "wh_out_today", "whOutToday"], pick(sum, ["wh_out_today", "whOutToday"], NaN)));
+  const whNet = Number(pick(e, ["totals.wh_net_today", "wh_net_today", "whNetToday"], pick(sum, ["wh_net_today", "whNetToday"], NaN)));
+
+  const env = pick(payload, ["env", "world", "state.env", "state.world"], {});
+  const lux = Number(pick(env, ["lux", "lightLux", "light", "bh1750Lux"], NaN));
+  const tOut = Number(pick(env, ["outdoorTempC", "airTempC", "temperature", "tempOutdoorC", "outsideTempC", "ds18b20C", "outTempC"], NaN));
+
+  // upsert with incremental stats
+  try {
+    await dbExec(`
+      INSERT INTO daily_stats(day, solar_wh, load_wh, net_wh, temp_out_min, temp_out_max, temp_out_sum, temp_out_n, temp_out_avg, lux_max, updated_at)
+      VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+      ON CONFLICT (day) DO UPDATE SET
+        solar_wh = COALESCE(EXCLUDED.solar_wh, daily_stats.solar_wh),
+        load_wh  = COALESCE(EXCLUDED.load_wh,  daily_stats.load_wh),
+        net_wh   = COALESCE(EXCLUDED.net_wh,   daily_stats.net_wh),
+        temp_out_min = CASE
+          WHEN EXCLUDED.temp_out_min IS NULL THEN daily_stats.temp_out_min
+          WHEN daily_stats.temp_out_min IS NULL THEN EXCLUDED.temp_out_min
+          ELSE LEAST(daily_stats.temp_out_min, EXCLUDED.temp_out_min) END,
+        temp_out_max = CASE
+          WHEN EXCLUDED.temp_out_max IS NULL THEN daily_stats.temp_out_max
+          WHEN daily_stats.temp_out_max IS NULL THEN EXCLUDED.temp_out_max
+          ELSE GREATEST(daily_stats.temp_out_max, EXCLUDED.temp_out_max) END,
+        temp_out_sum = daily_stats.temp_out_sum + COALESCE(EXCLUDED.temp_out_sum,0),
+        temp_out_n   = daily_stats.temp_out_n   + COALESCE(EXCLUDED.temp_out_n,0),
+        temp_out_avg = CASE WHEN (daily_stats.temp_out_n + COALESCE(EXCLUDED.temp_out_n,0)) > 0
+          THEN (daily_stats.temp_out_sum + COALESCE(EXCLUDED.temp_out_sum,0)) / (daily_stats.temp_out_n + COALESCE(EXCLUDED.temp_out_n,0))
+          ELSE daily_stats.temp_out_avg END,
+        lux_max = CASE
+          WHEN EXCLUDED.lux_max IS NULL THEN daily_stats.lux_max
+          WHEN daily_stats.lux_max IS NULL THEN EXCLUDED.lux_max
+          ELSE GREATEST(daily_stats.lux_max, EXCLUDED.lux_max) END,
+        updated_at = NOW();
+    `,[dayKey,
+        Number.isFinite(whIn) ? whIn : null,
+        Number.isFinite(whOut)? whOut: null,
+        Number.isFinite(whNet)? whNet: null,
+        Number.isFinite(tOut)? tOut: null,
+        Number.isFinite(tOut)? tOut: null,
+        Number.isFinite(tOut)? tOut: 0,
+        Number.isFinite(tOut)? 1: 0,
+        Number.isFinite(tOut)? tOut: null,
+        Number.isFinite(lux)? lux: null
+    ]);
+  } catch (e) {
+    console.log("[db] update daily failed:", String(e));
+  }
+}
 function withUiCompat(state) {
   if (!state || typeof state !== "object") return state;
 
@@ -374,6 +512,64 @@ app.get("/state", (req, res) => {
     },
     _waiting: !latestState,
   });
+
+// ===== Lifetime history API (Postgres) =====
+app.get("/history/range", async (req,res) => {
+  if (!DB_ENABLED) return res.status(400).json({ ok:false, error:"DB not configured (DATABASE_URL missing)" });
+  try {
+    const days = Number(req.query.days || 0);
+    const fromQ = String(req.query.from || "").slice(0,10);
+    const toQ = String(req.query.to || "").slice(0,10);
+    let sql = "SELECT day, solar_wh, load_wh, net_wh, temp_out_min, temp_out_max, temp_out_avg, lux_max FROM daily_stats";
+    const params=[];
+    if (days && days>0 && !fromQ && !toQ){
+      sql += " WHERE day >= (CURRENT_DATE - ($1 || ' days')::interval)";
+      params.push(days);
+    } else {
+      if (fromQ){ params.push(fromQ); sql += (params.length===1? " WHERE":" AND") + " day >= $"+params.length; }
+      if (toQ){ params.push(toQ);   sql += (params.length===1? " WHERE":" AND") + " day <= $"+params.length; }
+    }
+    sql += " ORDER BY day ASC";
+    const r = await dbExec(sql, params);
+    res.json({ ok:true, days: r.rows });
+  } catch(e){
+    res.status(500).json({ ok:false, error:String(e) });
+  }
+});
+
+app.get("/history/onthisday", async (req,res) => {
+  if (!DB_ENABLED) return res.status(400).json({ ok:false, error:"DB not configured (DATABASE_URL missing)" });
+  try {
+    const ref = String(req.query.date || "").slice(0,10);
+    const refDate = ref ? ref : new Date().toISOString().slice(0,10);
+    // previous year same month/day
+    const [y,m,d] = refDate.split("-").map(x=>parseInt(x,10));
+    const prev = `${y-1}-${String(m).padStart(2,"0")}-${String(d).padStart(2,"0")}`;
+    const r = await dbExec("SELECT day, solar_wh, load_wh, net_wh, temp_out_min, temp_out_max, temp_out_avg, lux_max FROM daily_stats WHERE day=$1",[prev]);
+    res.json({ ok:true, ref: refDate, compareDay: prev, row: r.rows[0] || null });
+  } catch(e){
+    res.status(500).json({ ok:false, error:String(e) });
+  }
+});
+
+app.get("/history/records", async (req,res) => {
+  if (!DB_ENABLED) return res.status(400).json({ ok:false, error:"DB not configured (DATABASE_URL missing)" });
+  try {
+    const rMaxT = await dbExec("SELECT day, temp_out_max AS value FROM daily_stats WHERE temp_out_max IS NOT NULL ORDER BY temp_out_max DESC NULLS LAST LIMIT 1");
+    const rMinT = await dbExec("SELECT day, temp_out_min AS value FROM daily_stats WHERE temp_out_min IS NOT NULL ORDER BY temp_out_min ASC NULLS LAST LIMIT 1");
+    const rSolar = await dbExec("SELECT day, solar_wh AS value FROM daily_stats WHERE solar_wh IS NOT NULL ORDER BY solar_wh DESC NULLS LAST LIMIT 1");
+    const rLoad = await dbExec("SELECT day, load_wh AS value FROM daily_stats WHERE load_wh IS NOT NULL ORDER BY load_wh DESC NULLS LAST LIMIT 1");
+    res.json({ ok:true, records:{
+      maxTemp: rMaxT?.rows?.[0] || null,
+      minTemp: rMinT?.rows?.[0] || null,
+      maxSolar: rSolar?.rows?.[0] || null,
+      maxLoad: rLoad?.rows?.[0] || null,
+    }});
+  } catch(e){
+    res.status(500).json({ ok:false, error:String(e) });
+  }
+});
+
 });
 
 // ESP32 sem posílá
@@ -400,6 +596,8 @@ app.post("/ingest", (req, res) => {
     console.log("[history] append failed:", String(e));
   }
 
+  // update DB daily aggregates (non-blocking)
+  dbUpdateDailyFromPayload(payload).catch(e => console.log('[db] update err', String(e)));
   saveLatestToDisk(payload);
 
   // odpověď pro ESP32
