@@ -1,14 +1,18 @@
 {
   "name": "meteostanice-hw-backend",
   "version": "0.1.0",
+  "private": true,
   "type": "module",
-  "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2",
+<<<<<<< HEAD
     "pg": "^8.13.1"
+=======
+    "pg": "^8.12.0"
+>>>>>>> f58889f50b61199fcddfcd54167e8278b2c4d1fd
   }
 }
